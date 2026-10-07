@@ -1,0 +1,327 @@
+const fetchProductsLexModel_1 = require("./models/fetchProductsLexModel");
+const baseModel_1 = require("./models/baseModel");
+const dynamoDB_1 = require("/opt/nodejs/aws/dynamoDB");
+const lex_1 = require("./lex");
+const lexModel_1 = require("./models/lexModel");
+const logger_1 = __importDefault(require("/opt/nodejs/logger/logger"));
+const utilityChecks_1 = require("/opt/nodejs/utilityChecks");
+const bundlesApiCall_1 = require("./services/bundlesApiCall");
+const productsCarousel_1 = require("./productsCarousel");
+const handleProductsRequest = async (intentName, sessionAttributes) => {
+    sessionAttributes = {
+        o2Customer: intentName,
+        "VM-S-NA-EXISTINGO2": intentName,
+        ...sessionAttributes
+    };
+    try {
+        const products = await fetchProducts(sessionAttributes);
+        sessionAttributes = {
+            ...sessionAttributes,
+            "VM-S-NA-PRODUCTID": products.product.productId,
+            "VM-S-NA-PRODUCTNAME": products.product.bundle.bundleName,
+            "VM-S-NA-PRODUCTURL": products.product.cartUrl,
+            "VM-S-NA-UPSELLID": products.upsell.productId,
+            "VM-S-NA-UPSELLNAME": products.upsell.bundle.bundleName,
+            "VM-S-NA-UPSELLURL": products.upsell.cartUrl,
+            "VM-S-NA-PRODUCTIMAGE": products.product.imageS3Key,
+            "VM-S-NA-UPSELLIMAGE": products.upsell.imageS3Key,
+            "VM-S-NA-PRODUCTAPI": "True",
+            retryCount: "0"
+        };
+        sessionAttributes.serviceabilityObject = fetchProductsLexModel_1.NOT_APPLICABLE;
+        const messages = await getMessages(sessionAttributes, products);
+        return (0, lex_1.elicitIntent)(messages.sessionAttributes, messages.messages);
+    }
+    catch (error) {
+        logger_1.default.error("handleProductsRequest::error:: " + (0, utilityChecks_1.getErrorMessage)(error));
+        return (0, lex_1.close)(intentName, lexModel_1.LexIntentState.FAILED, sessionAttributes, baseModel_1.Status.FAILURE, 500);
+    }
+};
+exports.handleProductsRequest = handleProductsRequest;
+const fetchProducts = async (sessionAttributes) => {
+    const { product, upsell } = await getProductsFromTable(sessionAttributes.need, sessionAttributes.o2Customer, (0, utilityChecks_1.isPresent)(sessionAttributes.tvChannels)
+        ? sessionAttributes.tvChannels
+        : fetchProductsLexModel_1.NOT_APPLICABLE, sessionAttributes.usage);
+    const productBundles = await (0, bundlesApiCall_1.fetchProductBundles)({ productId: product.productId, upsellId: upsell.productId }, sessionAttributes.serviceabilityObject, sessionAttributes.availableServices);
+    let productDetails = { ...product };
+    let upsellDetails = { ...upsell };
+    for (const bundle of productBundles.bundles) {
+        if (bundle.bundleId === product.productId) {
+            productDetails = { ...product, bundle: bundle };
+            if (product.productId === upsell.productId) {
+                upsellDetails = { ...upsell, bundle: bundle };
+            }
+            continue;
+        }
+        upsellDetails = { ...upsell, bundle: bundle };
+    }
+    return {
+        product: productDetails,
+        upsell: upsellDetails
+    };
+};
+const getProductsFromTable = async (need, o2Customer, tvChannels, usage) => {
+    logger_1.default.debug("getProductsFromTable:: Getting product recommendations from DynamoDB");
+    const scanInput = {
+        TableName: process.env.PRODUCT_RECOMMENDATIONS_TABLE_NAME,
+        FilterExpression: "Need = :need and contains(#usage, :usage) and O2Customer = :o2Customer and contains(TvChannels, :tvChannels)",
+        ExpressionAttributeNames: { "#usage": "Usage" },
+        ExpressionAttributeValues: {
+            ":need": need,
+            ":usage": usage,
+            ":o2Customer": o2Customer,
+            ":tvChannels": tvChannels
+        }
+    };
+    const scanResponse = (await (0, dynamoDB_1.scanItems)(scanInput)).Items;
+    if (scanResponse.length === 0 || !scanResponse[0].ProductId) {
+        throw new Error("No Product IDs found matching requirements");
+    }
+    return {
+        product: {
+            productId: scanResponse[0].ProductId,
+            imageS3Key: scanResponse[0].ProductImageS3Key ?? fetchProductsLexModel_1.NOT_APPLICABLE,
+            cartUrl: scanResponse[0].ProductCartUrl ?? fetchProductsLexModel_1.NOT_APPLICABLE
+        },
+        upsell: {
+            productId: scanResponse[0].UpsellId ?? fetchProductsLexModel_1.NOT_APPLICABLE,
+            imageS3Key: scanResponse[0].UpsellImageS3Key ?? fetchProductsLexModel_1.NOT_APPLICABLE,
+            cartUrl: scanResponse[0].UpsellCartUrl ?? fetchProductsLexModel_1.NOT_APPLICABLE
+        }
+    };
+};
+const getMessages = async (sessionAttributes, products) => {
+    let messages = [
+        {
+            contentType: lexModel_1.ContentType.PLAIN_TEXT,
+            content: `${getInitialMessage(sessionAttributes)} ${sessionAttributes.secondPrompt}`
+        }
+    ];
+    const productMessage = getProductMessage(sessionAttributes, products);
+    sessionAttributes = productMessage.sessionAttributes;
+    const skipProductMessages = sessionAttributes.skipProductMessages === "true";
+    if (!skipProductMessages) {
+        messages = messages
+            .concat(productMessage.messages)
+            .concat(getActivationFeeMessage(sessionAttributes, products));
+    }
+    let fallbackPrompt;
+    if (sessionAttributes["VM-CR-IDV-PLTFRM"] === "WHATSAPP") {
+        const imageUrl = await (0, productsCarousel_1.getImageUrl)(products.product.imageS3Key);
+        if (imageUrl !== fetchProductsLexModel_1.NOT_APPLICABLE) {
+            const imageUrlMessage = `image-only-message: ${imageUrl}`;
+            messages.push(getPlainTextMessage(imageUrlMessage));
+        }
+        const productImageMessage = (0, productsCarousel_1.getCarouselText)(products.product.bundle, sessionAttributes.waTextPrompt, sessionAttributes.waTitlePrompt);
+        messages.push(getPlainTextMessage(productImageMessage.body));
+        const waDtmfMessage = getWaDtmfMessage(sessionAttributes.carouselButtonsPrompt, sessionAttributes.preferencePrompt, products);
+        messages.push(getPlainTextMessage(waDtmfMessage));
+        fallbackPrompt = waDtmfMessage;
+        messages = [
+            getPlainTextMessage(JSON.stringify({ "array-of-messages": messages }))
+        ];
+    }
+    else {
+        const carouselMessage = JSON.stringify(await (0, productsCarousel_1.getProductsCarousel)(products, sessionAttributes));
+        fallbackPrompt = carouselMessage;
+        messages = messages.concat([
+            {
+                contentType: lexModel_1.ContentType.CUSTOM_PAYLOAD,
+                content: carouselMessage
+            }
+        ]);
+    }
+    return {
+        messages,
+        sessionAttributes: {
+            ...sessionAttributes,
+            fallbackPrompt
+        }
+    };
+};
+const getInitialMessage = (sessionAttributes) => {
+    if (sessionAttributes.need.toLowerCase().includes("TV".toLowerCase())) {
+        return sessionAttributes.initialPrompt.replace("{need}", "broadband and TV");
+    }
+    if (sessionAttributes.need.toLowerCase().includes("Phone".toLowerCase())) {
+        return sessionAttributes.initialPrompt.replace("{need}", "broadband and phone");
+    }
+    return sessionAttributes.initialPrompt.replace("{need}", "broadband");
+};
+const getProductMessage = (sessionAttributes, products) => {
+    let message = fetchProductsLexModel_1.NOT_APPLICABLE;
+    // One product recommendation
+    if (!(0, exports.isUpsellRequired)(products)) {
+        logger_1.default.debug("getProductMessage: One product recommendation");
+        message =
+            sessionAttributes.o2Customer === "Yes"
+                ? sessionAttributes.singleO2ExistingPrompt
+                : sessionAttributes.singlePrompt;
+        message = message.replace("{productName}", products.product.bundle.bundleName);
+        return { messages: [getPlainTextMessage(message)], sessionAttributes };
+    }
+    // Two product recommendations
+    logger_1.default.debug("getProductMessage: Two product recommendations");
+    const productPrices = (0, exports.getProductPrices)(products.product.bundle);
+    const upsellPrices = (0, exports.getProductPrices)(products.upsell.bundle);
+    const productSpeed = getProductSpeedInMbps(products.product.bundle.bundleName);
+    const upsellSpeed = getProductSpeedInMbps(products.upsell.bundle.bundleName);
+    const priceDifferencePerWeek = getPriceDifferencePerWeek(productPrices.contractCost, upsellPrices.contractCost);
+    sessionAttributes = {
+        "VM-S-NA-BUNDLESUBTOTAL": upsellPrices.contractCost,
+        ...sessionAttributes
+    };
+    if (productSpeed === fetchProductsLexModel_1.NOT_APPLICABLE || upsellSpeed === fetchProductsLexModel_1.NOT_APPLICABLE) {
+        message =
+            sessionAttributes.o2Customer === "Yes"
+                ? sessionAttributes.doubleO2ExistingNoSpeedsPrompt
+                : sessionAttributes.doubleNoSpeedsPrompt;
+    }
+    else {
+        message =
+            sessionAttributes.o2Customer === "Yes"
+                ? sessionAttributes.doubleO2ExistingPrompt
+                : sessionAttributes.doublePrompt;
+    }
+    message = message
+        .replace("{productName}", products.product.bundle.bundleName)
+        .replace("{extraPerWeek}", priceDifferencePerWeek)
+        .replace("{productSpeed}", productSpeed)
+        .replace("{upsellSpeed}", upsellSpeed)
+        .replace("{upsellName}", products.upsell.bundle.bundleName)
+        .replace("{simData}", getSimData(products));
+    if (sessionAttributes.o2Customer === "Yes") {
+        return { messages: [getPlainTextMessage(message)], sessionAttributes };
+    }
+    const upsellMessage = sessionAttributes.doubleUpsellPrompt.replace("{upsellTotalCost}", upsellPrices.contractCost);
+    return {
+        messages: [
+            getPlainTextMessage(message),
+            getPlainTextMessage(upsellMessage)
+        ],
+        sessionAttributes
+    };
+};
+const getPlainTextMessage = (message) => {
+    return {
+        contentType: lexModel_1.ContentType.PLAIN_TEXT,
+        content: message
+    };
+};
+const getProductPrices = (productDetails) => {
+    const bundleSubtotal = productDetails.totalMonthlyCosts.bundleSubtotal ?? [];
+    const priceRiseSteps = productDetails.totalMonthlyCosts.totalPoundsAndPencePriceSteps ?? [];
+    const formatDate = (date) => {
+        if (!date)
+            return "";
+        const d = new Date(date);
+        return isNaN(d.getTime())
+            ? ""
+            : d.toLocaleString("en-GB", { month: "long", year: "numeric" });
+    };
+    // Add all the normal contract price to an array
+    const priceSteps = [
+        ...bundleSubtotal.map((step) => ({
+            contractCost: step.amount,
+            contractDuration: step.duration?.toString(),
+            contractStartDate: formatDate(step.startDate ?? "")
+        })),
+        // Add all the price rise info to an array
+        ...priceRiseSteps.map((step) => ({
+            priceRiseCost: step.amount,
+            priceRiseDuration: step.duration?.toString(),
+            priceRiseStartDate: formatDate(step.startDate ?? "")
+        }))
+    ];
+    // Assign the values of contract cost, contract duration and fixed cost
+    const contractCost = bundleSubtotal[0].amount;
+    const contractDuration = bundleSubtotal[0].duration?.toString() ??
+        productDetails.contract.term.toString();
+    const fixedCost = bundleSubtotal[bundleSubtotal.length - 1].amount;
+    const hasOffer = bundleSubtotal.length > 2;
+    return {
+        contractCost,
+        contractDuration,
+        fixedCost,
+        hasOffer,
+        priceSteps
+    };
+};
+exports.getProductPrices = getProductPrices;
+const getPriceDifferencePerWeek = (productPrice, upsellPrice) => {
+    const productPriceFloat = parseFloat(productPrice);
+    const upsellPriceFloat = parseFloat(upsellPrice);
+    if (productPriceFloat && upsellPriceFloat) {
+        return ((upsellPriceFloat - productPriceFloat) / 4).toFixed(2);
+    }
+    return "0";
+};
+const getSimData = (products) => {
+    let simData = "0";
+    const bundleProducts = products.upsell.bundle.products;
+    for (const product of bundleProducts) {
+        if (product.productCategory === "SIM") {
+            const productName = product.productName;
+            simData = productName.match(/[1-9]\d?\d?GB/g)?.pop() ?? "0";
+        }
+    }
+    return simData;
+};
+const getActivationFeeMessage = (sessionAttributes, products) => {
+    let activationFee = "0";
+    const bundleProducts = products.upsell.bundle.products;
+    for (const product of bundleProducts) {
+        if (product.productName === fetchProductsLexModel_1.ACTIVATION_FEE_PRODUCT_NAME &&
+            (0, utilityChecks_1.isPresent)(product.prices)) {
+            let activationFeeUpdateCounter = 0;
+            for (const activationFeeProduct of product.prices) {
+                if (activationFeeUpdateCounter === 0 ||
+                    parseFloat(activationFeeProduct.price.amount) <
+                        parseFloat(activationFee)) {
+                    activationFee = activationFeeProduct.price.amount;
+                    activationFeeUpdateCounter++;
+                }
+            }
+        }
+    }
+    if (parseFloat(activationFee) === 0) {
+        return [getPlainTextMessage(sessionAttributes.activationFeeFreePrompt)];
+    }
+    return [
+        getPlainTextMessage(sessionAttributes.activationFeePrompt.replace("{activationFee}", activationFee))
+    ];
+};
+const getProductSpeedInMbps = (productName) => {
+    const regexp = /G[1-9]|Gig[1-9]|M[1-9]\d{1,2}/;
+    if (regexp.test(productName)) {
+        const speed = regexp.exec(productName)[0];
+        if (speed.startsWith("G")) {
+            const speedInMbps = parseInt(speed.substring(1, speed.length)) * 1024;
+            return `${speedInMbps}`;
+        }
+        return speed.substring(1, speed.length);
+    }
+    return fetchProductsLexModel_1.NOT_APPLICABLE;
+};
+const getWaDtmfMessage = (carouselPrompt, preferencePrompt, products) => {
+    const waDtmfOptions = [products.product.bundle.bundleName];
+    if ((0, exports.isUpsellRequired)(products)) {
+        waDtmfOptions.push(products.upsell.bundle.bundleName);
+    }
+    const carouselButtons = carouselPrompt.split("\n");
+    const lastButton = carouselButtons.pop() ?? "Question";
+    const penultimateButton = carouselButtons.pop() ?? "Agent Request";
+    waDtmfOptions.push(penultimateButton, lastButton);
+    const waDtmfMessageList = [`${preferencePrompt}\n`];
+    for (let i = 0; i < waDtmfOptions.length; i++) {
+        waDtmfMessageList.push(`${i + 1}. ${waDtmfOptions[i]}`);
+    }
+    return waDtmfMessageList.join("\n");
+};
+const isUpsellRequired = (products) => {
+    return (products.product.productId !== "9000" &&
+        products.product.productId !== "9148" &&
+        products.upsell.productId !== fetchProductsLexModel_1.NOT_APPLICABLE &&
+        products.product.productId !== products.upsell.productId);
+};
+exports.isUpsellRequired = isUpsellRequired;
